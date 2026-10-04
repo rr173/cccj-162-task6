@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -180,6 +181,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                 data = self.mgr.progress_page_data(parts[2])
                 return self._html(
                     render_progress_page(data), self.headers.get("Accept", ""))
+            # 多租户成组任务接纳器路由 (纯增量; 未命中任何既有路由时委托)。
+            if self.server.admission is not None:  # type: ignore[attr-defined]
+                from .admission.api import route_get
+                if route_get(self, parts):
+                    return
         except CpError as exc:
             return self._send_json(exc.http_status, exc.to_dict())
         self._send_json(404, {"error": "not_found", "message": self.path})
@@ -270,6 +276,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                     job_id=body.get("job_id"),
                     lease_ttl=float(body.get("lease_ttl", 300.0)),
                 ).snapshot(), status=201)
+
+            # 多租户成组任务接纳器路由 (纯增量; 在既有 jobs 专属路由的 404
+            # 提前返回之前先委托, 未命中再走原有逻辑, 既有行为不变)。
+            if parts[:2] == ["api", "admission"] and \
+                    self.server.admission is not None:  # type: ignore[attr-defined]
+                from .admission.api import route_post
+                if route_post(self, parts, body):
+                    return
 
             if len(parts) != 3 or parts[:2] != ["api", "jobs"]:
                 self._send_json(404, {"error": "not_found",
@@ -369,7 +383,8 @@ def render_index(mgr: JobManager) -> str:
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>HPC 抢占/检查点服务</title></head><body>
 <h1>HPC 作业抢占与检查点恢复</h1>
-<p><a href="/api/jobs">/api/jobs (JSON)</a></p>
+<p><a href="/api/jobs">/api/jobs (JSON)</a> ·
+<a href="/ui/admission">多租户成组任务接纳器 (队列/分配/运行状态)</a></p>
 <table border="1" cellpadding="6"><tr>
 <th>作业</th><th>名称</th><th>状态</th><th>规模</th><th>当前代际</th></tr>
 {rows or '<tr><td colspan=5>暂无作业</td></tr>'}
@@ -382,6 +397,7 @@ def build_server(
     port: int = 8080,
     verbose: bool = False,
     data_dir: str | None = None,
+    admission=None,
 ) -> ThreadingHTTPServer:
     manager = manager or build_default_manager(data_dir=data_dir)
 
@@ -393,6 +409,14 @@ def build_server(
     server.manager = manager  # type: ignore[attr-defined]
     server.verbose = verbose  # type: ignore[attr-defined]
     server.daemon_threads = True
+    # 多租户成组任务接纳器: 独立子系统, 数据落在 <data_dir>/admission,
+    # 与作业 journal 物理隔离; admission=None 时相关路由返回 404,
+    # 既有作业服务行为完全不变。
+    if admission is None:
+        from .admission import AdmissionManager
+        adm_dir = os.path.join(data_dir, "admission") if data_dir else None
+        admission = AdmissionManager(adm_dir)
+    server.admission = admission  # type: ignore[attr-defined]
     return server
 
 
@@ -403,6 +427,8 @@ def serve_forever(host: str = "127.0.0.1", port: int = 8080,
                           data_dir=data_dir)
     print(f"HPC checkpoint service on http://{host}:{port}  "
           f"(UI: http://{host}:{port}/ui/jobs/<job_id>)")
+    print(f"multi-tenant gang admission UI: "
+          f"http://{host}:{port}/ui/admission")
     if data_dir:
         print(f"persistent data directory: {data_dir}")
     try:

@@ -253,3 +253,91 @@ demo.py           # 端到端场景脚本 (可选 --data-dir 持久化)
   因此旧令牌重启后仍能被验证或被栅栏拒绝。
 
 不给定 `data_dir` 时全部退化为内存实现，接口行为一致。
+
+---
+
+# 多租户成组批任务接纳器 (multi-tenant gang admission)
+
+在不改动上述作业抢占/检查点恢复行为的前提下，同进程额外提供一个**独立
+子系统**（`hpc_cr/admission/`，数据落在 `<data_dir>/admission/`，事件日志
+`admission-journal.jsonl` 与作业 journal 物理隔离）。用户按租户提交需要
+**多台机器协同启动**的成组（gang）任务，组件按租户**权重 + 等候时长**
+安排次序，并按 CPU、内存与**按型号的加速器**需求从异构机器中**成组**
+分配容量。浏览器页面可查看队列、分配明细与运行状态。
+
+## 核心不变量
+
+| # | 不变量 | 实现位置 |
+|---|--------|----------|
+| A1 | **全有或全无**：一项任务所需的全部副本容量必须在一轮调度内同时取得才进入 `ALLOCATED`；影子视图上任一副本放不下即整体放弃，绝不留下部分占用 | `model.py::plan_gang_placement`、`manager.py::_commit_allocation` |
+| A2 | **不阻塞可启动任务**：放不下的队首任务被跳过，调度循环继续处理后续任务；未被预留的机器照常接纳此刻可成组启动的任何租户任务 | `manager.py::schedule` |
+| A3 | **权重公平 + 不饥饿**：`score = 等待秒数 × 租户权重`，同刻高权重优先，等待线性老化使任何任务终将成为队首；同租户内 FIFO（入队 seq 决胜），次序在页面/API 可解释 | `manager.py::_order`、`overview().queue_order` |
+| A4 | **成组预留（gang reservation）**：需要多台机器同时空出的最高分队首，其已空出机器被汇集预留（不切容量、不产生部分占用），忙碌机器记为“待释放”；空出一台汇集一台，副本齐备后一次性取得——久候任务等待有上界，不会被持续到达的小任务永久队首阻塞 | `model.py::Reservation`、`manager.py::_refresh_top_reservation` |
+| A5 | **业务键幂等/冲突**：同 `business_key` 再次提交且内容摘要一致→返回原任务与原结果（含已完成结果）；键相同但内容（需求或业务载荷）变化→`409 business_key_conflict` | `manager.py::submit`、`content_digest` |
+| A6 | **重启找回**：全部状态变更顺序化追加到独立 journal（fsync），重启重放重建租户权重、机器、等待项（QUEUED）与已分配但未归还的切片容量；重启后终止/完成正确归还、排队项继续推进 | `admission/journal.py`、`manager.py::_apply` |
+| A7 | **幂等撤回/终止/归还**：撤回排队项（`CANCELLED`）、终止已分配/运行项（`TERMINATED`，逐切片归还）均幂等，重复调用返回同一终态（`idempotent_replay`），不重复释放 | `manager.py::cancel_task/terminate_task/complete_task` |
+| A8 | **可解释拒绝/暂缓**：提交期对“单台物理放不下/整集群即使空闲也放不下”给出稳定缘由与缺口明细并置 `REJECTED`；调度期暂缓（集群忙/无匹配机器/无在线机器）记录缘由、最佳候选与缺口，不做永久拒绝 | `manager.py::_submission_infeasible`、`model.py::_shortage_explanation` |
+| A9 | **异构与独占**：机器声明 CPU/内存/按型号加速器；纯 CPU 副本优先无卡机（不浪费 GPU），带卡副本必须落到对应型号机器；`exclusive` 副本独占整台机器 | `model.py::_fit_key/plan_gang_placement` |
+
+## 任务状态机
+
+```
+QUEUED ──全部副本容量原子取得──▶ ALLOCATED ──start──▶ RUNNING
+  │                                  │                    │
+  │ cancel                           │ terminate          │ complete(succeeded)
+  ▼                                  ▼                    ▼
+CANCELLED                       TERMINATED (逐切片归还)  SUCCEEDED (容量归还)
+QUEUED ──提交期判定永不可满足──▶ REJECTED (带稳定缘由与缺口明细)
+```
+
+`ALLOCATED` 表示容量已原子取得、等待启动；`RUNNING` 由显式 `start` 标记。
+终止/失败/成功都会把任务当前仍占用的切片逐片归还（每片一条
+`adm_slice_released` 事件），并立即再跑一轮调度推进排队项。
+
+## 接纳器 API（全部新增于 `/api/admission/*`，不影响既有接口）
+
+| 方法/路径 | 说明 |
+|---|---|
+| `POST /api/admission/tenants` | 登记/更新租户（`tenant_id`、`weight`>0、`name`）；未登记租户首次提交自动以权重 1 登记 |
+| `GET  /api/admission/tenants` | 租户列表 + 公平性统计（权重、排队/占用数、最久等待、队首 score） |
+| `POST /api/admission/machines` | 登记/更新异构机器（`cpus`、`memory_mb`、`accelerators:{型号:数量}`、`state`）；有活跃占用时拒绝缩容 |
+| `POST /api/admission/machines/{id}` | `action=drain/online/offline`；有占用时拒绝 OFFLINE |
+| `GET  /api/admission/machines` / `/{id}` | 机器总量/空闲/已用、加速器余量与逐切片占用明细 |
+| `POST /api/admission/tasks` | 提交（`business_key`、`tenant_id`、`replicas`、`cpus_per_replica`、`memory_mb_per_replica`、`accelerators_per_replica`、`exclusive`、`payload`、`name`）；同键幂等/键同内容变 409；永不可满足直接 REJECTED |
+| `GET  /api/admission/tasks` | 任务列表（可按 `tenant_id`/`state` 过滤） |
+| `GET  /api/admission/tasks/{id}` | 单任务：状态、逐副本落点、切片、容量时间线、拒绝/暂缓缘由、结果 |
+| `POST /api/admission/tasks/by-key` | 按业务键取回原任务（含原结果） |
+| `POST /api/admission/tasks/{id}/start` | ALLOCATED→RUNNING（幂等） |
+| `POST /api/admission/tasks/{id}/cancel` | 撤回 QUEUED 项（幂等） |
+| `POST /api/admission/tasks/{id}/terminate` | 终止 ALLOCATED/RUNNING 项并归还容量（幂等，触发再调度） |
+| `POST /api/admission/tasks/{id}/complete` | 上报完成 `{status:succeeded|failed, result}`，归还容量（幂等） |
+| `POST /api/admission/schedule` | 手动触发一轮调度（提交/登记/撤回/终止/完成时也会自动触发） |
+| `GET  /api/admission/schedule` | 最近一轮调度报告（谁被接纳、谁暂缓及缘由、预留汇集进度） |
+| `GET  /api/admission/overview` | 总览聚合（租户统计、机器余量、按 score 的队列、活跃任务、预留） |
+| `GET  /ui/admission` | **队列/机器/运行状态总览页**（2s 自动刷新） |
+| `GET  /ui/admission/tasks/{id}` | 单任务页：**分配去向、容量变化时间线、拒绝缘由、结果** |
+| `GET  /ui/admission/machines/{id}` | 单机页：容量与逐切片占用明细 |
+
+错误码沿用既有约定：`400 validation_error`、`404 not_found`、
+`409 conflict`（含 `reason=business_key_conflict`）。
+
+## 持久化（与作业子系统隔离）
+
+- `<data_dir>/admission/admission-journal.jsonl`：接纳器独立的只追加事件
+  日志（独立 seq 水位），事件类型均以 `adm_` 前缀区分；写入 flush+fsync，
+  崩溃最多丢最后半行。重启按 seq 重放重建。
+- 切片分配是**单条原子事件**（`adm_task_allocated` 携带全部副本落点），
+  因此“部分副本已落盘”不可能发生；归还逐片记录，崩溃在终止中途也能在
+  重放后安全续跑、重复终止幂等。
+- 成组预留是**纯调度态**（不持久化）：重启后第一轮调度按当前最高分排队
+  任务确定性重建，已分配容量则完全由 journal 重建。
+
+测试：`tests/test_admission.py`（成组/全有或全无/不阻塞/公平/幂等/冲突）、
+`tests/test_admission_concurrency.py`（多线程同键、超卖、并发终止归还）、
+`tests/test_admission_persistence_http.py`（重启找回 + HTTP/页面端到端）。
+
+```bash
+python3 -m hpc_cr --data-dir ./hpc-data
+# 浏览器打开
+#   http://127.0.0.1:8080/ui/admission
+```
