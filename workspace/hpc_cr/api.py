@@ -109,10 +109,29 @@ class ApiHandler(BaseHTTPRequestHandler):
     # --------------------------------------------------------------- verbs
     def do_GET(self):  # noqa: N802
         parts = [p for p in urlsplit(self.path).path.split("/") if p]
+        # 多租户批接纳器 (独立子系统): 未启用时本分支不改变任何既有行为
+        if parts[:2] in (["api", "batch"], ["ui", "batch"]):
+            from urllib.parse import parse_qs
+            router = self._batch()
+            if router is None:
+                self._send_json(404, {"error": "not_found",
+                                      "message": "batch subsystem disabled"})
+                return
+            query = {k: v[0] for k, v in
+                     parse_qs(urlsplit(self.path).query).items()}
+            handled = False
+            try:
+                handled = router.get(self, parts, query)
+            except CpError as exc:
+                return self._send_json(exc.http_status, exc.to_dict())
+            if handled is not False:
+                return
+            return self._send_json(404, {"error": "not_found",
+                                         "message": self.path})
         try:
             if parts == ["healthz"]:
                 return self._send_json(200, {"ok": True})
-            if parts == [""]:
+            if not parts:
                 return self._html(
                     render_index(self.mgr), self.headers.get("Accept", "")
                 )
@@ -186,6 +205,23 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802
         parts = [p for p in urlsplit(self.path).path.split("/") if p]
+        # 多租户批接纳器 (独立子系统): 支持 JSON 与页面表单两种 body
+        if parts[:2] == ["api", "batch"] or \
+                parts[:3] == ["ui", "batch", "forms"]:
+            from .batch.api import read_request_body
+            router = self._batch()
+            if router is None:
+                self._send_json(404, {"error": "not_found",
+                                      "message": "batch subsystem disabled"})
+                return
+            try:
+                body = read_request_body(self)
+            except CpError as exc:
+                return self._send_json(exc.http_status, exc.to_dict())
+            if router.post(self, parts, body) is False:
+                self._send_json(404, {"error": "not_found",
+                                      "message": self.path})
+            return
         body = self._safe_body()
         if isinstance(body, CpError):
             return self._send_json(body.http_status, body.to_dict())
@@ -357,6 +393,17 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _redirect(self, location: str):
+        self.send_response(303)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    # ------------------------------------------------------------- batch
+    def _batch(self):
+        """批接纳子系统路由 (可选); 未启用时为 None, 主服务行为不变。"""
+        return getattr(self.server, "batch_router", None)  # type: ignore[attr-defined]
+
 
 def render_index(mgr: JobManager) -> str:
     rows = "".join(
@@ -369,7 +416,8 @@ def render_index(mgr: JobManager) -> str:
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>HPC 抢占/检查点服务</title></head><body>
 <h1>HPC 作业抢占与检查点恢复</h1>
-<p><a href="/api/jobs">/api/jobs (JSON)</a></p>
+<p><a href="/api/jobs">/api/jobs (JSON)</a>
+· <a href="/ui/batch">多租户批任务接纳器</a></p>
 <table border="1" cellpadding="6"><tr>
 <th>作业</th><th>名称</th><th>状态</th><th>规模</th><th>当前代际</th></tr>
 {rows or '<tr><td colspan=5>暂无作业</td></tr>'}
@@ -382,6 +430,9 @@ def build_server(
     port: int = 8080,
     verbose: bool = False,
     data_dir: str | None = None,
+    batch_manager=None,
+    enable_batch: bool = True,
+    batch_auto_tick: bool = False,
 ) -> ThreadingHTTPServer:
     manager = manager or build_default_manager(data_dir=data_dir)
 
@@ -393,18 +444,36 @@ def build_server(
     server.manager = manager  # type: ignore[attr-defined]
     server.verbose = verbose  # type: ignore[attr-defined]
     server.daemon_threads = True
+
+    # 多租户批接纳器: 默认启用, 独立事件日志 (<data_dir>/batch/),
+    # 与作业恢复状态完全分离; enable_batch=False 时不创建, 路由返回 404。
+    from .batch.api import BatchRouter
+
+    if batch_manager is not None:
+        server.batch_router = BatchRouter(batch_manager)  # type: ignore[attr-defined]
+    elif enable_batch:
+        from .batch import BatchManager
+
+        bm = BatchManager(data_dir, auto_tick=batch_auto_tick)
+        server.batch_manager = bm  # type: ignore[attr-defined]
+        server.batch_router = BatchRouter(bm)  # type: ignore[attr-defined]
     return server
 
 
 def serve_forever(host: str = "127.0.0.1", port: int = 8080,
                   verbose: bool = False,
-                  data_dir: str | None = None) -> None:  # pragma: no cover
+                  data_dir: str | None = None,
+                  enable_batch: bool = True) -> None:  # pragma: no cover
     server = build_server(host=host, port=port, verbose=verbose,
-                          data_dir=data_dir)
+                          data_dir=data_dir, enable_batch=enable_batch,
+                          batch_auto_tick=enable_batch)
     print(f"HPC checkpoint service on http://{host}:{port}  "
           f"(UI: http://{host}:{port}/ui/jobs/<job_id>)")
     if data_dir:
         print(f"persistent data directory: {data_dir}")
+    if enable_batch:
+        print(f"multi-tenant batch admission UI: "
+              f"http://{host}:{port}/ui/batch")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

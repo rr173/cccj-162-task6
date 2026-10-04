@@ -253,3 +253,100 @@ demo.py           # 端到端场景脚本 (可选 --data-dir 持久化)
   因此旧令牌重启后仍能被验证或被栅栏拒绝。
 
 不给定 `data_dir` 时全部退化为内存实现，接口行为一致。
+
+---
+
+# 多租户批任务接纳器（增量子系统）
+
+`hpc_cr/batch/` 是与抢占/检查点恢复服务**完全独立**的增量子系统：用户按
+**租户**提交需要多台机器**协同启动**的成组（gang）批任务，组件按各租户
+**权重与等候时长**安排次序，再按 **CPU / 内存 / 加速器（GPU）** 需求从
+异构机器中**成组**分配，并提供浏览器页面查看队列、分配明细与运行状态。
+它有独立的锁、独立事件日志（`<data_dir>/batch/journal.jsonl`）与独立
+路由前缀（`/api/batch/*`、`/ui/batch/*`），**不改变既有作业恢复行为**
+（全部既有 92 个测试仍通过；`--no-batch` 可完全禁用该子系统）。
+
+## 批接纳核心不变量
+
+| # | 不变量 | 实现位置 |
+|---|--------|----------|
+| B1 | **成组容量全有或全无**：一项任务所需的 N 台机器容量必须**一次性全部取得**才启动；资源不够时不留下任何部分占用，任务保持 QUEUED | `scheduling.find_placement`、`manager._schedule_locked` |
+| B2 | **无跨租户队头阻塞**：某租户队首任务此刻装不下时只跳过该租户，继续尝试后续租户，其他租户此刻可启动的任务照常启动 | `manager._schedule_locked` 多趟扫描 |
+| B3 | **权重公平可解释**：每租户一个加权虚拟时间 `fair_key`，每接纳一个任务前进 `1/weight`；无限积压下吞吐严格按权重比例（如 3:1 实测 3.00）。调度轮次逐租户记录 `(score, decision, reason)` | `scheduling.order_queued/tenant_score`、`/api/batch/passes` |
+| B4 | **久候不无限期饥饿**：老化只按*该租户队首自身*等候时长（超过阈值后得分线性下移），所有租户同积压时老化量相互抵消故权重比例不被破坏；持续被跳过的低权重租户在有限墙上时间内必定启动（默认 30s 阈值） | `scheduling.tenant_score`、后台 ticker / `scheduler/tick` |
+| B5 | **业务键幂等与冲突**：相同 `(tenant, business_key)` 同内容（规范化 JSON 的 sha256 指纹）再次提交返回原任务/原结果；键相同但内容变化稳定返回 `409 business_key_conflict`，绝不覆盖 | `manager.compute_digest/submit_task` |
+| B6 | **接纳期总量闸门**：全集群（未 REMOVED 的匹配机器）物理总量都不可能满足的任务在提交时即 409 拒绝（稳定原因码），不制造注定永远排队的等待项；瞬时碎片 / DRAINING（可能恢复）只排队不拒绝 | `scheduling.cluster_feasible` |
+| B7 | **撤回 / 终止 / 归还幂等**：撤回 QUEUED、终止 RUNNING、`release` 对任意状态均幂等；容量账目逐台 pop，重复/并发/重启都恰好归还一次，绝不二次扣减 | `manager.cancel/terminate/release_resources/_finish_locked` |
+| B8 | **事件溯源重启恢复**：排队项与已分配机器容量均从独立 journal 重放重建；重启后业务键索引、占用账目、幂等语义全部继续生效 | `batch/manager._replay`、`persistence.Journal` |
+
+## 任务 / 机器状态机
+
+```
+任务: QUEUED ──成组容量全部取得──▶ RUNNING ──complete──▶ COMPLETED
+          │                           ├──fail──────────▶ FAILED
+          ├──cancel(幂等)──▶ CANCELLED └──terminate(幂等)─▶ TERMINATED
+          └──deadline 到期自动取消 (有界等待)
+机器: ENABLED ⇄ DRAINING (不再接纳新任务, 可恢复); 任意状态(空闲) ──▶ REMOVED
+```
+
+## 批接纳 HTTP 接口
+
+| 方法/路径 | 说明 |
+|---|---|
+| `POST /api/batch/tenants` | 登记租户（`tenant_id`、`weight`）；重复登记 409 |
+| `POST /api/batch/tenants/{id}` | 调整权重（立即影响公平次序） |
+| `GET  /api/batch/tenants` | 租户权重、虚拟键、已接纳数、排队/运行数、最久等候与当前得分 |
+| `POST /api/batch/machines` | 登记异构机器（`cpu/mem/gpu` 总量、`labels`） |
+| `POST /api/batch/machines/{id}` | 调整总量（不得缩到当前用量以下）/ 标签 |
+| `POST /api/batch/machines/state` | ENABLED / DRAINING / REMOVED（占用中不允许 REMOVED） |
+| `GET  /api/batch/machines` | 机器总量/已用/空闲/占用明细/容量变化时间线 |
+| `POST /api/batch/tasks` | 提交成组任务：`tenant_id`、`business_key`、`machine_count`、每台 `need{cpu,mem,gpu}`、标签 `selector`、可选 `deadline_seconds`；同键同内容幂等、异内容 409、超总量 409 |
+| `POST /api/batch/tasks/{id}/cancel` | 撤回排队项（幂等） |
+| `POST /api/batch/tasks/{id}/terminate` | 终止运行项并归还全部容量（幂等） |
+| `POST /api/batch/tasks/{id}/complete` / `fail` | 上报完成（带 `result`，幂等）/ 失败 |
+| `POST /api/batch/tasks/{id}/release` | 幂等归还资源（RUNNING→终止，QUEUED→撤回，终态→空操作） |
+| `POST /api/batch/scheduler/tick` | 显式触发一轮调度（默认也有 1s 后台 ticker 处理老化/过期） |
+| `GET  /api/batch/tasks` | 任务列表（可按 `tenant_id`/`state` 过滤） |
+| `GET  /api/batch/tasks/{id}` | 单任务：分配去向、容量时间线、最近推迟缘由、结果 |
+| `GET  /api/batch/passes` | 最近调度轮次（每租户得分/决策/原因，公平性可解释） |
+| `GET  /api/batch/dashboard` | 总览聚合数据（页面同源数据） |
+| `GET  /ui/batch` | **队列/权重/机器/运行/终态总览页面**（2s 刷新，含提交/撤回/终止表单） |
+| `GET  /ui/batch/tasks/{id}` | **单任务页面**：每台分配去向、容量变化、拒绝缘由 |
+| `POST /ui/batch/forms/{tenant,machine,submit}` | 页面表单（成功 303 跳回总览） |
+
+### 稳定拒绝原因码（`reason`，页面逐项展示）
+
+- 接纳期（409）：`insufficient_cluster_machines`（匹配机器总数不足）、
+  `cluster_cpu_exceeded` / `cluster_mem_exceeded` / `cluster_gpu_exceeded`
+  （全集群对应维度总量不足）、`business_key_conflict`（同键异内容）。
+- 调度推迟（任务保持 QUEUED，`last_defer`）：`no_enabled_machine`、
+  `insufficient_matching_machines`、`insufficient_free_capacity`
+  （附匹配机器数、此刻可放下数与聚合缺口）。
+- 状态机（409）：`not_cancellable` / `not_terminatable` / `not_running`。
+
+## 批接纳运行与演示
+
+```bash
+# 端到端演示 (纯内存)
+python3 demo_batch.py
+# 持久化演示 (事件落盘, 重跑自动找回排队项与已分配容量)
+python3 demo_batch.py --data-dir ./bm-data
+# 演示后继续提供 HTTP 服务, 浏览器打开总览
+python3 demo_batch.py --serve --port 8080        # http://127.0.0.1:8080/ui/batch
+
+# 随主服务启动 (默认启用, 独立 <data_dir>/batch 日志)
+python3 -m hpc_cr --data-dir ./hpc-data
+python3 -m hpc_cr --no-batch                     # 禁用批接纳器, 行为与旧版一致
+
+# 批接纳测试 (32 个: 成组/公平/老化/幂等/HTTP/并发/重启持久化)
+python3 -m unittest tests.test_batch_scheduler \
+                      tests.test_batch_http tests.test_batch_persistence -v
+```
+
+持久化目录布局新增（不触碰既有文件）：
+
+- `batch/journal.jsonl`：批接纳器独立只追加事件日志（租户/机器/任务提交、
+  推迟、成组分配、完成/失败/撤回/终止），与作业 `journal.jsonl` 分离；
+  重启重放后，RUNNING 任务在每台机器上的容量占用精确恢复（不多不少），
+  QUEUED 任务与业务键幂等索引继续生效。
+
